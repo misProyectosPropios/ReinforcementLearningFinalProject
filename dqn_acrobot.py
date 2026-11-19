@@ -17,7 +17,7 @@ import argparse
 import os
 import random
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import gymnasium as gym
 import matplotlib
@@ -62,6 +62,11 @@ class DQNConfig:
     # Opciones de ejecución y salida
     use_cuda: bool = True
     save_model_path: str = "dqn_acrobot.pt"
+    best_model_path: str = "dqn_acrobot_best.pt"
+    checkpoint_every: int = 50    # Cada cuántos episodios guardar checkpoint de pesos (0 = desactivado)
+    checkpoint_dir: str = "checkpoints"
+    resume: bool = False          # Si True, carga best_model_path (si existe) y continúa entrenando
+    load_model_path: Optional[str] = None  # Ruta explícita de pesos .pt para reanudar entrenamiento
     plot_path: str = "dqn_acrobot_rewards.png"
     show_plot: bool = True
 
@@ -198,7 +203,45 @@ def train_dqn(cfg: DQNConfig) -> dict:
 
     q_network = QNetwork(obs_dim, n_actions).to(device)
     target_network = QNetwork(obs_dim, n_actions).to(device)
-    target_network.load_state_dict(q_network.state_dict())
+
+    best_eval_reward: Optional[float] = None
+    best_episode = 0
+
+    weights_to_load: Optional[str] = None
+    if cfg.load_model_path:
+        if not os.path.exists(cfg.load_model_path):
+            raise FileNotFoundError(f"No se encontró el archivo de pesos a cargar: '{cfg.load_model_path}'")
+        weights_to_load = cfg.load_model_path
+    elif cfg.resume:
+        if cfg.best_model_path and os.path.exists(cfg.best_model_path):
+            weights_to_load = cfg.best_model_path
+        else:
+            print(
+                f"[Resume] No se encontró '{cfg.best_model_path}'. "
+                "Se iniciará el entrenamiento desde cero."
+            )
+
+    if weights_to_load:
+        state_dict = torch.load(weights_to_load, map_location=device, weights_only=True)
+        q_network.load_state_dict(state_dict)
+        target_network.load_state_dict(state_dict)
+        baseline_mean, baseline_std = evaluate_policy(
+            q_network,
+            cfg.env_id,
+            device,
+            n_episodes=cfg.eval_episodes,
+            seed=cfg.seed + 10_000,
+        )
+        best_eval_reward = baseline_mean
+        best_episode = 0
+        if cfg.best_model_path and not os.path.exists(cfg.best_model_path):
+            torch.save(q_network.state_dict(), cfg.best_model_path)
+        print(
+            f"[Resume] Pesos cargados desde: {weights_to_load} | "
+            f"Eval greedy inicial: {baseline_mean:.2f} ± {baseline_std:.2f}"
+        )
+    else:
+        target_network.load_state_dict(q_network.state_dict())
 
     optimizer = optim.Adam(q_network.parameters(), lr=cfg.learning_rate)
     replay_buffer = ReplayBuffer(cfg.buffer_size, obs_dim)
@@ -216,6 +259,9 @@ def train_dqn(cfg: DQNConfig) -> dict:
 
     global_step = 0
     exploration_episodes = max(1, int(cfg.exploration_fraction * cfg.num_episodes))
+
+    if cfg.checkpoint_every > 0 and cfg.checkpoint_dir:
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     print(f"Entrenando DQN en {cfg.env_id} | dispositivo: {device} | episodios: {cfg.num_episodes}")
     print(
@@ -290,6 +336,8 @@ def train_dqn(cfg: DQNConfig) -> dict:
         episode_epsilons.append(epsilon)
         episode_losses.append(float(np.mean(ep_losses)) if ep_losses else float("nan"))
 
+        current_eval_mean: Optional[float] = None
+
         # Resumen y evaluación cada `eval_every` episodios (por defecto: cada 20 episodios)
         if episode % cfg.eval_every == 0:
             recent_mean = float(np.mean(episode_rewards[-cfg.eval_every :]))
@@ -300,11 +348,21 @@ def train_dqn(cfg: DQNConfig) -> dict:
                 n_episodes=cfg.eval_episodes,
                 seed=cfg.seed + 10_000 + episode,
             )
+            current_eval_mean = eval_mean
 
             block_episodes.append(episode)
             block_mean_rewards.append(recent_mean)
             eval_mean_rewards.append(eval_mean)
             eval_std_rewards.append(eval_std)
+
+            if cfg.best_model_path and (
+                best_eval_reward is None
+                or eval_mean > best_eval_reward
+                or not os.path.exists(cfg.best_model_path)
+            ):
+                best_eval_reward = eval_mean
+                best_episode = episode
+                torch.save(q_network.state_dict(), cfg.best_model_path)
 
             mean_loss = np.nanmean(episode_losses[-cfg.eval_every :])
             loss_str = f"{mean_loss:.4f}" if not np.isnan(mean_loss) else "warming-up"
@@ -314,11 +372,55 @@ def train_dqn(cfg: DQNConfig) -> dict:
                 f"Eval(greedy): {eval_mean:7.2f} ± {eval_std:5.2f} | Loss: {loss_str}"
             )
 
+        # Checkpoint periódico de pesos cada `checkpoint_every` episodios
+        if cfg.checkpoint_every > 0 and episode % cfg.checkpoint_every == 0:
+            ckpt_filename = f"dqn_acrobot_ep{episode:04d}.pt"
+            ckpt_path = (
+                os.path.join(cfg.checkpoint_dir, ckpt_filename)
+                if cfg.checkpoint_dir
+                else ckpt_filename
+            )
+            torch.save(q_network.state_dict(), ckpt_path)
+
+            if current_eval_mean is None:
+                current_eval_mean, _ = evaluate_policy(
+                    q_network,
+                    cfg.env_id,
+                    device,
+                    n_episodes=cfg.eval_episodes,
+                    seed=cfg.seed + 10_000 + episode,
+                )
+
+            best_updated = False
+            if cfg.best_model_path and (
+                best_eval_reward is None
+                or current_eval_mean > best_eval_reward
+                or not os.path.exists(cfg.best_model_path)
+            ):
+                best_eval_reward = current_eval_mean
+                best_episode = episode
+                torch.save(q_network.state_dict(), cfg.best_model_path)
+                best_updated = True
+
+            best_note = (
+                f" | Nuevo mejor modelo guardado en {cfg.best_model_path} ({best_eval_reward:.2f})"
+                if best_updated
+                else f" | Mejor actual: ep {best_episode} ({best_eval_reward:.2f})"
+                if best_eval_reward is not None
+                else ""
+            )
+            print(f"  [Checkpoint] Pesos guardados en: {ckpt_path}{best_note}")
+
     env.close()
 
     if cfg.save_model_path:
         torch.save(q_network.state_dict(), cfg.save_model_path)
-        print(f"\nModelo guardado en: {cfg.save_model_path}")
+        print(f"\nModelo final guardado en: {cfg.save_model_path}")
+    if cfg.best_model_path and best_eval_reward is not None:
+        print(
+            f"Mejor modelo guardado en: {cfg.best_model_path} "
+            f"(ep {best_episode}, Eval greedy: {best_eval_reward:.2f})"
+        )
 
     return {
         "episode_rewards": episode_rewards,
@@ -458,15 +560,35 @@ def parse_args() -> DQNConfig:
     parser.add_argument("--gamma", type=float, default=0.99, help="Factor de descuento")
     parser.add_argument("--buffer-size", type=int, default=10_000, help="Capacidad del Replay Buffer")
     parser.add_argument("--batch-size", type=int, default=128, help="Tamaño de minibatch")
-    parser.add_argument("--learning-starts", type=int, default=10_000, help="Pasos iniciales antes de entrenar")
+    parser.add_argument("--learning-starts", type=int, default=None, help="Pasos iniciales antes de entrenar (default: 10000 desde cero, 1000 al reanudar)")
+    parser.add_argument("--start-e", type=float, default=None, help="Epsilon inicial (default: 1.0 desde cero, 0.2 al reanudar)")
     parser.add_argument("--train-frequency", type=int, default=10, help="Pasos de entorno entre actualizaciones")
     parser.add_argument("--target-freq", type=int, default=500, help="Pasos entre copias a la target network")
     parser.add_argument("--tau", type=float, default=1.0, help="Coeficiente de actualización de la target network")
     parser.add_argument("--exploration-fraction", type=float, default=0.5, help="Fracción de episodios de decaimiento de epsilon")
     parser.add_argument("--plot-path", type=str, default="dqn_acrobot_rewards.png", help="Ruta para guardar el gráfico")
-    parser.add_argument("--model-path", type=str, default="dqn_acrobot.pt", help="Ruta para guardar los pesos")
+    parser.add_argument("--model-path", type=str, default="dqn_acrobot.pt", help="Ruta para guardar los pesos finales")
+    parser.add_argument("--best-model-path", type=str, default="dqn_acrobot_best.pt", help="Ruta para guardar los mejores pesos")
+    parser.add_argument("--checkpoint-every", type=int, default=50, help="Frecuencia de checkpoints de pesos en episodios (0 = desactivado)")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Carpeta donde guardar los checkpoints periódicos")
+    parser.add_argument("--resume", action="store_true", help="Cargar best-model-path (si existe) y continuar entrenando desde ahí")
+    parser.add_argument("--load-model", type=str, default=None, help="Ruta explícita a un archivo .pt de pesos para continuar entrenando")
     parser.add_argument("--no-show", action="store_true", help="No abrir ventana interactiva de matplotlib")
     args = parser.parse_args()
+
+    resuming_from_existing = bool(args.load_model) or (
+        args.resume and bool(args.best_model_path) and os.path.exists(args.best_model_path)
+    )
+    learning_starts = (
+        args.learning_starts
+        if args.learning_starts is not None
+        else (1_000 if resuming_from_existing else 10_000)
+    )
+    start_e = (
+        args.start_e
+        if args.start_e is not None
+        else (0.2 if resuming_from_existing else 1.0)
+    )
 
     return DQNConfig(
         num_episodes=args.episodes,
@@ -476,13 +598,19 @@ def parse_args() -> DQNConfig:
         gamma=args.gamma,
         buffer_size=args.buffer_size,
         batch_size=args.batch_size,
-        learning_starts=args.learning_starts,
+        start_e=start_e,
+        learning_starts=learning_starts,
         train_frequency=args.train_frequency,
         target_network_frequency=args.target_freq,
         tau=args.tau,
         exploration_fraction=args.exploration_fraction,
         plot_path=args.plot_path,
         save_model_path=args.model_path,
+        best_model_path=args.best_model_path,
+        checkpoint_every=args.checkpoint_every,
+        checkpoint_dir=args.checkpoint_dir,
+        resume=args.resume,
+        load_model_path=args.load_model,
         show_plot=not args.no_show,
     )
 
