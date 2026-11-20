@@ -211,3 +211,6 @@ python watch_dqn.py --episodes 1 --save-gif acrobot_demo.gif --headless
 - **CleanRL Reference Script:** https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/dqn.py
 - **CleanRL Benchmark Hyperparameters (`Acrobot-v1`):** https://huggingface.co/cleanrl/Acrobot-v1-dqn-seed1
 - **Project Colab Notebook:** https://colab.research.google.com/drive/1pNA22KwiHcLFymrv6XLboaYn9R_nwaVj?usp=sharing
+
+# colab Pacman PPO:
+https://colab.research.google.com/drive/1pNA22KwiHcLFymrv6XLboaYn9R_nwaVj?usp=sharing
