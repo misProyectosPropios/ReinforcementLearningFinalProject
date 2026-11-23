@@ -197,7 +197,7 @@ def print_table(summary: dict, n_seeds: int, n_eval: int) -> None:
 
 
 def plot(summary: dict, path: str, n_seeds: int) -> None:
-    colors = {"DQN": "#2a78d6", "PPO": "#eb6834"}  # azul / naranja (validados: CVD ΔE>24)
+    colors = {"DQN": "#D81F1F", "PPO": "#1723d3"}  # azul / naranja (validados: CVD ΔE>24)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4), sharey=False)
     x = np.arange(len(EVAL_POLICIES))
     w = 0.36
@@ -208,25 +208,34 @@ def plot(summary: dict, path: str, n_seeds: int) -> None:
             means = [summary[algo][p][metric][0] for p in EVAL_POLICIES]
             stds = [summary[algo][p][metric][1] for p in EVAL_POLICIES]
             bars = ax.bar(
-                x + (k - 0.5) * w, means, w - 0.03, yerr=stds if n_seeds > 1 else None,
+                x + (k - 0.5) * w, means, w - 0.03,
+                # los % no pasan de [0, 100]: se recortan las barras de error a ese rango
+                yerr=[[min(s, m) for m, s in zip(means, stds)],
+                      [min(s, 100 - m) for m, s in zip(means, stds)]] if n_seeds > 1 else None,
                 color=colors.get(algo, "#888888"), label=algo, capsize=3,
                 error_kw=dict(ecolor="#52514e", lw=1),
             )
-            for b, v in zip(bars, means):
-                ax.text(b.get_x() + b.get_width() / 2, v + 1.5, f"{v:.0f}", ha="center",
+            for b, v, s in zip(bars, means, stds):
+                # el número va por encima del extremo superior de la barra de error
+                top = v + (min(s, 100 - v) if n_seeds > 1 else 0.0)
+                ax.text(b.get_x() + b.get_width() / 2, top + 1.5, f"{v:.0f}", ha="center",
                         va="bottom", fontsize=8, color="#52514e")
         ax.set_xticks(x)
         ax.set_xticklabels([f"{p}\n(entrenamiento)" if p == "chaser" else p for p in EVAL_POLICIES])
-        ax.set_title(title, loc="left", fontsize=11)
-        ax.set_ylim(0, 105)
+        ax.set_title(title, loc="left", fontsize=11, pad=10)
+        ax.set_ylim(0, 112)  # espacio extra arriba para barras de error + números
+        ax.set_yticks([0, 20, 40, 60, 80, 100])
         ax.spines[["top", "right"]].set_visible(False)
         ax.grid(axis="y", alpha=0.25)
-    axes[0].legend(frameon=False, loc="upper left")
+    # Leyenda a nivel figura, fuera de los ejes (no tapa barras)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, loc="upper right", ncol=len(labels),
+               bbox_to_anchor=(0.99, 0.99))
     fig.suptitle(
         f"Generalización a otros fantasmas (entrenado solo vs 'chaser'; {n_seeds} semilla(s), media ± desvío)",
-        fontsize=11, x=0.01, ha="left",
+        fontsize=11, x=0.01, y=0.99, ha="left",
     )
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(path, dpi=160)
     plt.close(fig)
     print(f"Gráfico guardado en {path}")
@@ -242,7 +251,18 @@ def main() -> None:
     p.add_argument("--eval-episodes", type=int, default=100, help="episodios de evaluación por política de fantasma")
     p.add_argument("--smoke", action="store_true", help="prueba rápida (3000 pasos, 1 semilla, 10 episodios)")
     p.add_argument("--out-prefix", default="ghost_generalization", help="prefijo de los archivos de salida")
+    p.add_argument("--plot-only", action="store_true",
+                   help="no entrena: regenera tabla y gráfico desde <out-prefix>_results.json")
     args = p.parse_args()
+
+    if args.plot_only:
+        with open(f"{args.out_prefix}_results.json") as f:
+            saved = json.load(f)
+        summary = summarize(saved["raw"])
+        n_seeds, n_eval = saved["args"]["seeds"], saved["args"]["eval_episodes"]
+        print_table(summary, n_seeds, n_eval)
+        plot(summary, f"{args.out_prefix}_comparison.png", n_seeds)
+        return
     if args.smoke:
         args.timesteps, args.seeds, args.eval_episodes = 3_000, 1, 10
 
