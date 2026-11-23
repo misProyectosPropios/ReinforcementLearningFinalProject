@@ -29,6 +29,11 @@ Uso
     python experiment_ghost_generalization.py --timesteps 20000 --seeds 1 --eval-episodes 20   # medir tiempos
     python experiment_ghost_generalization.py --timesteps 150000 --seeds 3 --eval-episodes 100 # corrida final
 
+Agregar semillas sin recalcular las anteriores (suma al JSON existente):
+    python experiment_ghost_generalization.py --seeds 3 --seed-start 3 --timesteps 150000 --eval-episodes 100
+
+Regenerar solo tabla y gráfico:  python experiment_ghost_generalization.py --plot-only
+
 Genera `ghost_generalization_results.json` y `ghost_generalization_comparison.png`.
 """
 
@@ -36,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from typing import Callable, Dict, List
 
@@ -197,7 +203,7 @@ def print_table(summary: dict, n_seeds: int, n_eval: int) -> None:
 
 
 def plot(summary: dict, path: str, n_seeds: int) -> None:
-    colors = {"DQN": "#D81F1F", "PPO": "#1723d3"}  # azul / naranja (validados: CVD ΔE>24)
+    colors = {"DQN": "#2a78d6", "PPO": "#eb6834"}  # azul / naranja (validados: CVD ΔE>24)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4), sharey=False)
     x = np.arange(len(EVAL_POLICIES))
     w = 0.36
@@ -244,22 +250,36 @@ def plot(summary: dict, path: str, n_seeds: int) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def n_runs(raw: dict) -> int:
+    return len(raw["DQN"]["chaser"])
+
+
+def save_json(path: str, args, seed_list, results) -> None:
+    meta = {**vars(args), "seed_list": seed_list, "seeds": len(seed_list)}
+    with open(path, "w") as f:
+        json.dump({"args": meta, "raw": results, "summary": summarize(results)}, f, indent=2)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--timesteps", type=int, default=150_000, help="pasos de entrenamiento por algoritmo y semilla")
-    p.add_argument("--seeds", type=int, default=3, help="semillas de entrenamiento por algoritmo")
+    p.add_argument("--seeds", type=int, default=3, help="cantidad de semillas de entrenamiento por algoritmo")
+    p.add_argument("--seed-start", type=int, default=0,
+                   help="primera semilla (usa seed-start..seed-start+seeds-1). Si ya existe el JSON de "
+                        "resultados, los nuevos se SUMAN a los anteriores (mismos timesteps y eval-episodes)")
     p.add_argument("--eval-episodes", type=int, default=100, help="episodios de evaluación por política de fantasma")
     p.add_argument("--smoke", action="store_true", help="prueba rápida (3000 pasos, 1 semilla, 10 episodios)")
     p.add_argument("--out-prefix", default="ghost_generalization", help="prefijo de los archivos de salida")
     p.add_argument("--plot-only", action="store_true",
                    help="no entrena: regenera tabla y gráfico desde <out-prefix>_results.json")
     args = p.parse_args()
+    json_path = f"{args.out_prefix}_results.json"
 
     if args.plot_only:
-        with open(f"{args.out_prefix}_results.json") as f:
+        with open(json_path) as f:
             saved = json.load(f)
         summary = summarize(saved["raw"])
-        n_seeds, n_eval = saved["args"]["seeds"], saved["args"]["eval_episodes"]
+        n_seeds, n_eval = n_runs(saved["raw"]), saved["args"]["eval_episodes"]
         print_table(summary, n_seeds, n_eval)
         plot(summary, f"{args.out_prefix}_comparison.png", n_seeds)
         return
@@ -270,9 +290,31 @@ def main() -> None:
     results: Dict[str, Dict[str, List[dict]]] = {
         a: {pol: [] for pol in EVAL_POLICIES} for a in trainers
     }
+    seed_list: List[int] = []
+
+    # Si ya hay resultados previos, se suman (para agregar semillas sin recalcular)
+    if os.path.exists(json_path) and not args.smoke:
+        with open(json_path) as f:
+            saved = json.load(f)
+        old = saved["args"]
+        if old["timesteps"] != args.timesteps or old["eval_episodes"] != args.eval_episodes:
+            raise SystemExit(
+                f"{json_path} se hizo con timesteps={old['timesteps']}, eval_episodes={old['eval_episodes']}; "
+                "no se pueden mezclar con otros valores. Usá otro --out-prefix o los mismos valores."
+            )
+        seed_list = list(old.get("seed_list", range(old["seeds"])))
+        new_seeds = list(range(args.seed_start, args.seed_start + args.seeds))
+        repeated = [s for s in new_seeds if s in seed_list]
+        if repeated:
+            raise SystemExit(
+                f"Las semillas {repeated} ya están en {json_path} (tiene {seed_list}). "
+                "Usá --seed-start con una semilla nueva."
+            )
+        results = saved["raw"]
+        print(f"Se suman a los resultados existentes (semillas {seed_list}).")
 
     t0 = time.time()
-    for seed in range(args.seeds):
+    for seed in range(args.seed_start, args.seed_start + args.seeds):
         for algo, trainer in trainers.items():
             t1 = time.time()
             print(f"\n>>> {algo} | semilla {seed} | {args.timesteps} pasos")
@@ -285,13 +327,14 @@ def main() -> None:
                     f"    vs {pol:9s} capturas {res['caught']:5.1f}% | bolitas {res['pellets']:5.1f}% | "
                     f"victorias {res['win']:5.1f}% | R {res['reward']:6.2f}"
                 )
+        seed_list.append(seed)
+        save_json(json_path, args, seed_list, results)  # se guarda tras cada semilla completa
 
     summary = summarize(results)
-    print_table(summary, args.seeds, args.eval_episodes)
-    with open(f"{args.out_prefix}_results.json", "w") as f:
-        json.dump({"args": vars(args), "raw": results, "summary": summary}, f, indent=2)
-    plot(summary, f"{args.out_prefix}_comparison.png", args.seeds)
-    print(f"\nTiempo total: {(time.time() - t0) / 60:.1f} min")
+    print_table(summary, len(seed_list), args.eval_episodes)
+    plot(summary, f"{args.out_prefix}_comparison.png", len(seed_list))
+    print(f"\nSemillas incluidas: {seed_list}")
+    print(f"Tiempo total de esta corrida: {(time.time() - t0) / 60:.1f} min")
 
 
 if __name__ == "__main__":
